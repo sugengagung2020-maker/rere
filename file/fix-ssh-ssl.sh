@@ -2,25 +2,28 @@
 # ========================================================
 # fix-ssh-ssl.sh
 #
-# Fix VPS yang sudah pernah install rere fork ini sebelum stream-mode
-# benar-benar bekerja. Script ini idempotent — aman dijalankan
-# berkali-kali.
+# Migrasi VPS rere ke arsitektur "edge-mux":
+#
+#   Public 443/80 -> iptables -> sslh-public (2443/2081)
+#                                   |
+#                                   tls -> stunnel:1015 [TLS termination, cert=xray]
+#                                                |
+#                                                v
+#                                          sslh-internal:8444 [HTTP/SSH probe]
+#                                                |--- HTTP -> nginx:2080 -> xray
+#                                                +--- SSH  -> OpenSSH:22
+#                                   ssh -> OpenSSH:22 (SSH direct di 443/80)
+#                                   http -> nginx:2080
+#                                   socks5 -> Dante:1080
+#
+# Dengan setup ini, klien inject yang pakai SNI=bug-host (mis.
+# live.iflix.com) yang sama untuk xray DAN SSH SSL akan dirute dengan
+# benar berdasarkan protokol setelah TLS termination, bukan SNI.
 #
 # Cara pakai (di VPS, sebagai root):
 #   bash <(curl -sL https://raw.githubusercontent.com/sugengagung2020-maker/rere/main/file/fix-ssh-ssl.sh)
 #
-# Yang dilakukan:
-#   1. Install libnginx-mod-stream kalau belum ada.
-#   2. Pastikan load_module ngx_stream_module.so ada di nginx.conf
-#      (upstream nginx.conf tidak include modules-enabled/, jadi
-#      directive 'stream' tidak dikenali tanpa load_module eksplisit).
-#   3. Re-generate /etc/sslh/sslh.cfg supaya semua TLS diteruskan ke
-#      127.0.0.1:8443 (nginx-stream) — bukan SNI matching di sslh.
-#   4. Tambah/replace stream block di nginx.conf:
-#        SNI = ${domain}  -> 127.0.0.1:1013 (nginx http TLS, xray)
-#        default          -> 127.0.0.1:1015 (stunnel -> OpenSSH:22)
-#   5. nginx -t. Kalau gagal -> auto-revert nginx.conf dari backup.
-#   6. Restart sslh dan nginx.
+# Script idempotent — aman dijalankan berkali-kali.
 # ========================================================
 
 set -e
@@ -46,34 +49,25 @@ NGINX_CONF=/etc/nginx/nginx.conf
 TS=$(date +%s)
 BACKUP_DIR="/root/rere-fix-ssh-ssl-backup-$TS"
 mkdir -p "$BACKUP_DIR"
-[ -f /etc/sslh/sslh.cfg ]   && cp /etc/sslh/sslh.cfg   "$BACKUP_DIR/sslh.cfg"
-[ -f /etc/default/sslh ]    && cp /etc/default/sslh    "$BACKUP_DIR/sslh.default"
-[ -f "$NGINX_CONF" ]        && cp "$NGINX_CONF"        "$BACKUP_DIR/nginx.conf"
+[ -f /etc/sslh/sslh.cfg ]              && cp /etc/sslh/sslh.cfg              "$BACKUP_DIR/sslh.cfg"
+[ -f /etc/sslh/sslh-internal.cfg ]     && cp /etc/sslh/sslh-internal.cfg     "$BACKUP_DIR/sslh-internal.cfg"
+[ -f /etc/default/sslh ]               && cp /etc/default/sslh               "$BACKUP_DIR/sslh.default"
+[ -f /etc/stunnel/ssh-ssl.conf ]       && cp /etc/stunnel/ssh-ssl.conf       "$BACKUP_DIR/stunnel-ssh.conf"
+[ -f "$NGINX_CONF" ]                   && cp "$NGINX_CONF"                   "$BACKUP_DIR/nginx.conf"
 echo "[fix-ssh-ssl] Backup config lama -> $BACKUP_DIR"
 
-# 1. Install libnginx-mod-stream
-if ! dpkg -s libnginx-mod-stream >/dev/null 2>&1; then
-    echo "[fix-ssh-ssl] Installing libnginx-mod-stream ..."
+# 1. Pastikan stunnel4 terpasang
+if ! command -v stunnel4 >/dev/null 2>&1; then
+    echo "[fix-ssh-ssl] Installing stunnel4 ..."
     DEBIAN_FRONTEND=noninteractive apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y libnginx-mod-stream
-else
-    echo "[fix-ssh-ssl] libnginx-mod-stream sudah terpasang."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y stunnel4
 fi
 
-# 2. Cari path module stream
-NGX_STREAM_MOD="$(ls /usr/lib/nginx/modules/ngx_stream_module.so /usr/share/nginx/modules/ngx_stream_module.so 2>/dev/null | head -n1)"
-if [ -z "$NGX_STREAM_MOD" ]; then
-    echo "[fix-ssh-ssl] ERROR: ngx_stream_module.so tidak ditemukan setelah install. Abort."
-    exit 1
-fi
-echo "[fix-ssh-ssl] Stream module path: $NGX_STREAM_MOD"
-
-# 3. Bersihkan stream block & load_module lama (kalau ada) supaya idempotent
+# 2. Cleanup nginx.conf dari sisa percobaan stream/SNI sebelumnya (idempotent)
 if [ -f "$NGINX_CONF" ]; then
     # Hapus baris load_module ngx_stream_module.so yang lama
     sed -i '/^load_module .*ngx_stream_module\.so;\?$/d' "$NGINX_CONF"
-    # Hapus blok stream { ... } yang ditandai dengan rerechan_tls_upstream (di-append oleh script ini sebelumnya)
-    # Pakai awk untuk hapus dari komentar marker sampai closing brace pertama dengan brace counting
+    # Hapus blok stream { ... } yang ditandai dengan "Stream block (SNI router)"
     awk '
         BEGIN { skip=0; depth=0 }
         /^# ===== Stream block \(SNI router/ { skip=1; depth=0; next }
@@ -87,40 +81,21 @@ if [ -f "$NGINX_CONF" ]; then
     ' "$NGINX_CONF" > "${NGINX_CONF}.tmp" && mv "${NGINX_CONF}.tmp" "$NGINX_CONF"
 fi
 
-# 4. Prepend load_module di baris paling atas
-sed -i "1i load_module ${NGX_STREAM_MOD};\n" "$NGINX_CONF"
+# 3. Test nginx -t setelah cleanup; auto-revert kalau gagal
+echo "[fix-ssh-ssl] Test nginx config setelah cleanup ..."
+if ! nginx -t 2>&1; then
+    echo "[fix-ssh-ssl] ERROR: nginx -t gagal setelah cleanup. Auto-revert nginx.conf."
+    cp "$BACKUP_DIR/nginx.conf" "$NGINX_CONF"
+    exit 1
+fi
 
-# 5. Append stream block baru
-cat >> "$NGINX_CONF" <<EOF
-
-# ===== Stream block (SNI router) =====
-# Ditambahkan oleh fix-ssh-ssl.sh.
-# SNI = ${DOMAIN}        -> 127.0.0.1:1013 (nginx http TLS, xray)
-# SNI lain / kosong      -> 127.0.0.1:1015 (stunnel -> OpenSSH:22)
-stream {
-    map \$ssl_preread_server_name \$rerechan_tls_upstream {
-        ${DOMAIN}    127.0.0.1:1013;
-        default     127.0.0.1:1015;
-    }
-
-    server {
-        listen 127.0.0.1:8443;
-        ssl_preread on;
-        proxy_pass \$rerechan_tls_upstream;
-        proxy_connect_timeout 10s;
-    }
-}
-EOF
-echo "[fix-ssh-ssl] Stream block + load_module ditambahkan ke $NGINX_CONF."
-
-# 6. Re-generate /etc/sslh/sslh.cfg
+# 4. Re-generate sslh-public config (tls -> stunnel:1015)
 mkdir -p /etc/sslh /var/run/sslh
 
 cat > /etc/default/sslh <<'EOF'
 # Managed by sugengagung2020-maker/rere fix-ssh-ssl.sh
-# Mode: config file (sslh-select)
 RUN=yes
-DAEMON=/usr/sbin/sslh-select
+DAEMON=/usr/sbin/sslh
 DAEMON_OPTS="-F /etc/sslh/sslh.cfg"
 EOF
 chmod 644 /etc/default/sslh
@@ -144,55 +119,162 @@ listen:
 protocols:
 (
     { name: "ssh";    host: "127.0.0.1"; port: "22";   probe: "builtin"; },
-    { name: "tls";    host: "127.0.0.1"; port: "8443"; probe: "builtin"; },
+    { name: "tls";    host: "127.0.0.1"; port: "1015"; probe: "builtin"; },
     { name: "socks5"; host: "127.0.0.1"; port: "1080"; probe: "builtin"; },
     { name: "http";   host: "127.0.0.1"; port: "2080"; probe: "builtin"; }
 );
 EOF
 chmod 644 /etc/sslh/sslh.cfg
-echo "[fix-ssh-ssl] /etc/sslh/sslh.cfg di-regenerate."
+echo "[fix-ssh-ssl] sslh-public config OK."
 
-# 7. Test config + restart, auto-revert nginx kalau gagal
-echo "[fix-ssh-ssl] Test nginx config ..."
-if ! nginx -t 2>&1; then
-    echo "[fix-ssh-ssl] ERROR: nginx -t gagal. Auto-revert nginx.conf dari backup."
-    cp "$BACKUP_DIR/nginx.conf" "$NGINX_CONF"
-    systemctl restart nginx || true
-    echo "[fix-ssh-ssl] nginx.conf di-revert. Cek detail error di atas."
-    exit 1
+# 5. Generate sslh-internal config (post-TLS HTTP/SSH dispatcher)
+cat > /etc/sslh/sslh-internal.cfg <<'EOF'
+verbose: false;
+foreground: false;
+inetd: false;
+numeric: false;
+transparent: false;
+timeout: 2;
+user: "sslh";
+pidfile: "/var/run/sslh/sslh-internal.pid";
+
+listen:
+(
+    { host: "127.0.0.1"; port: "8444"; }
+);
+
+protocols:
+(
+    { name: "ssh";  host: "127.0.0.1"; port: "22";   probe: "builtin"; },
+    { name: "http"; host: "127.0.0.1"; port: "2080"; probe: "builtin"; },
+    { name: "anyprot"; host: "127.0.0.1"; port: "22"; }
+);
+EOF
+chmod 644 /etc/sslh/sslh-internal.cfg
+echo "[fix-ssh-ssl] sslh-internal config OK."
+
+# 6. Generate sslh-internal systemd service
+cat > /etc/systemd/system/sslh-internal.service <<'EOF'
+[Unit]
+Description=SSLH internal post-TLS protocol dispatcher (HTTP/SSH)
+Documentation=https://github.com/sugengagung2020-maker/rere
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/sbin/sslh --foreground -F /etc/sslh/sslh-internal.cfg
+KillMode=process
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1000000
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# 7. Update stunnel: forward ke sslh-internal (8444), bukan langsung OpenSSH:22
+mkdir -p /etc/stunnel /var/run
+cat > /etc/stunnel/ssh-ssl.conf <<'EOF'
+foreground = no
+setuid = root
+setgid = root
+pid = /var/run/stunnel-ssh.pid
+socket = l:TCP_NODELAY=1
+socket = r:TCP_NODELAY=1
+
+[edge-mux]
+accept = 127.0.0.1:1015
+connect = 127.0.0.1:8444
+cert = /usr/local/etc/xray/xray.crt
+key = /usr/local/etc/xray/xray.key
+client = no
+EOF
+chmod 644 /etc/stunnel/ssh-ssl.conf
+
+# Pastikan systemd unit stunnel-ssh ada
+if [ ! -f /etc/systemd/system/stunnel-ssh.service ]; then
+    cat > /etc/systemd/system/stunnel-ssh.service <<'EOF'
+[Unit]
+Description=Stunnel TLS termination -> sslh-internal (HTTP/SSH dispatch)
+Documentation=https://github.com/sugengagung2020-maker/rere
+After=network-online.target ssh.service sshd.service sslh-internal.service
+Wants=network-online.target
+
+[Service]
+Type=forking
+ExecStart=/usr/bin/stunnel4 /etc/stunnel/ssh-ssl.conf
+PIDFile=/var/run/stunnel-ssh.pid
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1000000
+
+[Install]
+WantedBy=multi-user.target
+EOF
 fi
+echo "[fix-ssh-ssl] stunnel config OK (forward ke 8444)."
 
-echo "[fix-ssh-ssl] Restart sslh + nginx ..."
+# 8. Reload + restart semua service terkait
+echo "[fix-ssh-ssl] Reload + restart services ..."
 systemctl daemon-reload
+systemctl enable sslh-internal stunnel-ssh sslh nginx >/dev/null 2>&1 || true
+
 systemctl restart nginx
+systemctl restart sslh-internal
+systemctl restart stunnel-ssh
 systemctl restart sslh
 
-# Sanity check
-sleep 1
+# 9. Sanity check
+sleep 2
 ALL_GOOD=1
-if ss -tlnp 2>/dev/null | grep -q "127.0.0.1:8443"; then
-    echo "[fix-ssh-ssl] OK: nginx-stream listen di 127.0.0.1:8443."
-else
-    echo "[fix-ssh-ssl] FAIL: 127.0.0.1:8443 tidak listen."
-    ALL_GOOD=0
-fi
-if ss -tlnp 2>/dev/null | grep -q "0.0.0.0:2443"; then
-    echo "[fix-ssh-ssl] OK: sslh listen di 0.0.0.0:2443."
-else
-    echo "[fix-ssh-ssl] FAIL: 0.0.0.0:2443 tidak listen."
-    ALL_GOOD=0
-fi
-if ss -tlnp 2>/dev/null | grep -q "127.0.0.1:1015"; then
-    echo "[fix-ssh-ssl] OK: stunnel listen di 127.0.0.1:1015."
-else
-    echo "[fix-ssh-ssl] WARN: 127.0.0.1:1015 tidak listen (stunnel-ssh mati?). SSH SSL kemungkinan tidak konek."
-fi
+check_listen() {
+    local addr="$1" label="$2"
+    if ss -tlnp 2>/dev/null | grep -qE "(^|\s)${addr//./\\.}(\s|$)"; then
+        echo "[fix-ssh-ssl] OK: $label listen di $addr."
+    else
+        echo "[fix-ssh-ssl] FAIL: $label tidak listen di $addr."
+        ALL_GOOD=0
+    fi
+}
+check_listen "0.0.0.0:2443"   "sslh-public"
+check_listen "0.0.0.0:2081"   "sslh-public"
+check_listen "127.0.0.1:1015" "stunnel"
+check_listen "127.0.0.1:8444" "sslh-internal"
+check_listen "127.0.0.1:2080" "nginx http (HUP NTLS)"
+check_listen "0.0.0.0:22"     "OpenSSH"
 
 echo
 if [ "$ALL_GOOD" = "1" ]; then
-    echo "[fix-ssh-ssl] Selesai. Test:"
-    echo "  - Xray HUP TLS via klien existing dengan SNI = $DOMAIN  -> harus konek."
-    echo "  - HTTP Custom 'SSL only' + SNI bug bebas (mis. live.iflix.com) port 443 -> harus konek SSH."
+    cat <<EOM
+[fix-ssh-ssl] SELESAI. Test:
+
+  Xray (semua mode TLS) — di klien (v2rayng/netmod/dll):
+      Address : <domain VPS>
+      Host    : live.iflix.com   (atau bug-host pilihan)
+      SNI     : live.iflix.com
+      Path    : /vless-hup atau /vmess-hup atau /trojan-hup (HUP)
+                /vless atau /vmess atau /trojan (WS)
+      Port    : 443
+
+  SSH SSL via APK inject (HTTP Custom dll) — "SSL only":
+      SNI     : live.iflix.com (bebas)
+      Address : <domain VPS>:443
+
+  SSH direct: port 443 atau 80, langsung tanpa TLS.
+
+Backup config lama: $BACKUP_DIR
+EOM
 else
-    echo "[fix-ssh-ssl] Selesai dengan WARNING. Cek 'systemctl status nginx sslh stunnel-ssh' dan log."
+    cat <<EOM
+[fix-ssh-ssl] SELESAI dengan WARNING. Cek detail:
+    systemctl status sslh sslh-internal stunnel-ssh nginx --no-pager | head -50
+    journalctl -u sslh-internal --no-pager -n 30
+    journalctl -u stunnel-ssh --no-pager -n 30
+
+Restore manual kalau perlu:
+    cp $BACKUP_DIR/nginx.conf /etc/nginx/nginx.conf
+    cp $BACKUP_DIR/sslh.cfg /etc/sslh/sslh.cfg
+    cp $BACKUP_DIR/stunnel-ssh.conf /etc/stunnel/ssh-ssl.conf
+    systemctl restart nginx sslh stunnel-ssh
+EOM
 fi
