@@ -185,7 +185,14 @@ DAEMON_OPTS="-F /etc/sslh/sslh.cfg"
 EOF
 chmod 644 /etc/default/sslh
 
-cat > /etc/sslh/sslh.cfg <<EOF
+# Catatan: SNI-based routing yang "persisten" tidak dilakukan oleh sslh
+# (`sni_hostnames` di sslh-select 1.20 tidak reliable). Sebagai gantinya,
+# sslh hanya bertugas multiplex SSH/TLS/HTTP/SOCKS5 lalu meneruskan SEMUA
+# TLS ke nginx-stream port 8443. Nginx-stream pakai ssl_preread untuk
+# membaca SNI dan memilih backend:
+#   SNI = ${domain}     -> nginx-http 127.0.0.1:1013 (xray HUP/gRPC/WS-TLS)
+#   SNI lain (default)  -> stunnel 127.0.0.1:1015 -> OpenSSH:22 (SSH SSL)
+cat > /etc/sslh/sslh.cfg <<'EOF'
 verbose: false;
 foreground: false;
 inetd: false;
@@ -204,8 +211,7 @@ listen:
 protocols:
 (
     { name: "ssh";    host: "127.0.0.1"; port: "22";   probe: "builtin"; },
-    { name: "tls";    host: "127.0.0.1"; port: "1013"; sni_hostnames: [ "${domain}" ]; probe: "builtin"; },
-    { name: "tls";    host: "127.0.0.1"; port: "1015"; probe: "builtin"; },
+    { name: "tls";    host: "127.0.0.1"; port: "8443"; probe: "builtin"; },
     { name: "socks5"; host: "127.0.0.1"; port: "1080"; probe: "builtin"; },
     { name: "http";   host: "127.0.0.1"; port: "2080"; probe: "builtin"; }
 );
@@ -285,11 +291,34 @@ sudo systemctl daemon-reload
 sudo systemctl restart danted
 sudo systemctl enable danted
 
-# Setup Nginx
+# Setup Nginx (+ stream module untuk SNI routing TLS)
 apt install nginx -y
+apt install libnginx-mod-stream -y
 rm -f /etc/nginx/nginx.conf
 wget -O /etc/nginx/nginx.conf "${hosting}/nginx.conf"
 sed -i "s|server_name fn.com;|server_name $domain;|" /etc/nginx/nginx.conf
+
+# Append stream block: SNI-based router untuk traffic TLS dari sslh.
+# - SNI = $domain          -> 127.0.0.1:1013 (nginx http TLS-termination utk xray)
+# - SNI lain / kosong      -> 127.0.0.1:1015 (stunnel -> OpenSSH:22)
+cat >> /etc/nginx/nginx.conf <<EOF
+
+# ===== Stream block (SNI router) =====
+stream {
+    map \$ssl_preread_server_name \$rerechan_tls_upstream {
+        ${domain}    127.0.0.1:1013;
+        default     127.0.0.1:1015;
+    }
+
+    server {
+        listen 127.0.0.1:8443;
+        ssl_preread on;
+        proxy_pass \$rerechan_tls_upstream;
+        proxy_connect_timeout 10s;
+    }
+}
+EOF
+
 systemctl stop nginx
 systemctl disable nginx
 
