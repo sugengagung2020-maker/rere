@@ -9,7 +9,12 @@
 # ========================================================
 
 # Define Hosting
-hosting="https://raw.githubusercontent.com/mousethain/rere/main/file"
+# Set to this fork's raw URL so the xray + httpupgrade assets bundled in this
+# repo (config.json, nginx.conf, main.zip) are actually deployed onto the VPS.
+# The previous upstream (mousethain/rere) still hosts the v2ray-era assets
+# without httpupgrade inbounds / locations, which silently breaks the
+# httpupgrade transport even though the install.sh logic has been migrated.
+hosting="https://raw.githubusercontent.com/SukiSuki40/rere/main/file"
 
 if [ -f "/usr/local/etc/xray/domain" ]; then
 echo "Script Already Installed"
