@@ -166,32 +166,37 @@ rm -f m.zip
 systemctl stop apache2
 systemctl disable apache2
 
-# Setup SSLH (config-file mode + SNI-based TLS routing untuk SSH SSL)
-# Listener 1: 0.0.0.0:2443 -> dipakai untuk traffic publik 443 (via iptables 443->2443)
-# Listener 2: 0.0.0.0:2081 -> dipakai untuk traffic publik 80  (via iptables 80->2081)
-# TLS routing:
-#   - SNI = ${domain} (xray HUP/gRPC/WS-TLS)              -> nginx 127.0.0.1:1013
-#   - SNI lain (mis. live.iflix.com utk SSH SSL inject)    -> stunnel 127.0.0.1:1015 -> OpenSSH:22
-# Raw SSH (SSH direct di 443/80) -> OpenSSH:22
-# HTTP (xray HUP NTLS / WS NTLS) -> nginx 127.0.0.1:2080
-# SOCKS5 (Dante) -> 127.0.0.1:1080
+# Setup SSLH (config-file mode) + sslh-internal (post-TLS protocol dispatcher)
+#
+# Arsitektur (mendukung inject bug-host: SNI = bug, Host = bug, address = domain):
+#
+#   Public 443/80 -> iptables -> sslh-public (2443/2081) [multiplex SSH/TLS/HTTP/SOCKS5]
+#                                   |
+#                                   tls -> stunnel:1015 [TLS termination, cert=xray]
+#                                                |
+#                                                v
+#                                          sslh-internal:8444 [HTTP/SSH probe]
+#                                                |--- HTTP -> nginx:2080 -> xray
+#                                                +--- SSH  -> OpenSSH:22
+#                                   ssh -> OpenSSH:22 (SSH direct di 443/80)
+#                                   http -> nginx:2080 (HUP NTLS / WS NTLS)
+#                                   socks5 -> Dante:1080
+#
+# Note: SNI-based routing tidak dipakai (gagal untuk inject klien yang pakai
+# SNI = bug-host yang sama untuk xray dan SSH SSL). Semua TLS diterminasi
+# dulu oleh stunnel, baru protokolnya dideteksi (HTTP vs SSH) oleh
+# sslh-internal.
 mkdir -p /etc/sslh /var/run/sslh
 cat > /etc/default/sslh <<'EOF'
 # Managed by sugengagung2020-maker/rere installer.
-# Mode: config file (sslh-select) untuk dukungan SNI-based TLS routing.
+# Mode: config file (sslh-select).
 RUN=yes
 DAEMON=/usr/sbin/sslh-select
 DAEMON_OPTS="-F /etc/sslh/sslh.cfg"
 EOF
 chmod 644 /etc/default/sslh
 
-# Catatan: SNI-based routing yang "persisten" tidak dilakukan oleh sslh
-# (`sni_hostnames` di sslh-select 1.20 tidak reliable). Sebagai gantinya,
-# sslh hanya bertugas multiplex SSH/TLS/HTTP/SOCKS5 lalu meneruskan SEMUA
-# TLS ke nginx-stream port 8443. Nginx-stream pakai ssl_preread untuk
-# membaca SNI dan memilih backend:
-#   SNI = ${domain}     -> nginx-http 127.0.0.1:1013 (xray HUP/gRPC/WS-TLS)
-#   SNI lain (default)  -> stunnel 127.0.0.1:1015 -> OpenSSH:22 (SSH SSL)
+# sslh-public: multiplex SSH/TLS/HTTP/SOCKS5 di port publik (via iptables)
 cat > /etc/sslh/sslh.cfg <<'EOF'
 verbose: false;
 foreground: false;
@@ -211,12 +216,57 @@ listen:
 protocols:
 (
     { name: "ssh";    host: "127.0.0.1"; port: "22";   probe: "builtin"; },
-    { name: "tls";    host: "127.0.0.1"; port: "8443"; probe: "builtin"; },
+    { name: "tls";    host: "127.0.0.1"; port: "1015"; probe: "builtin"; },
     { name: "socks5"; host: "127.0.0.1"; port: "1080"; probe: "builtin"; },
     { name: "http";   host: "127.0.0.1"; port: "2080"; probe: "builtin"; }
 );
 EOF
 chmod 644 /etc/sslh/sslh.cfg
+
+# sslh-internal: post-TLS dispatcher (HTTP -> nginx, SSH -> OpenSSH)
+# Listener cuma di 127.0.0.1:8444 - menerima traffic dari stunnel.
+cat > /etc/sslh/sslh-internal.cfg <<'EOF'
+verbose: false;
+foreground: false;
+inetd: false;
+numeric: false;
+transparent: false;
+timeout: 2;
+user: "sslh";
+pidfile: "/var/run/sslh/sslh-internal.pid";
+
+listen:
+(
+    { host: "127.0.0.1"; port: "8444"; }
+);
+
+protocols:
+(
+    { name: "ssh";  host: "127.0.0.1"; port: "22";   probe: "builtin"; },
+    { name: "http"; host: "127.0.0.1"; port: "2080"; probe: "builtin"; },
+    { name: "anyprot"; host: "127.0.0.1"; port: "22"; }
+);
+EOF
+chmod 644 /etc/sslh/sslh-internal.cfg
+
+# Systemd unit untuk sslh-internal (terpisah dari sslh.service stock)
+cat > /etc/systemd/system/sslh-internal.service <<'EOF'
+[Unit]
+Description=SSLH internal post-TLS protocol dispatcher (HTTP/SSH)
+Documentation=https://github.com/sugengagung2020-maker/rere
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/sbin/sslh --foreground -F /etc/sslh/sslh-internal.cfg
+KillMode=process
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1000000
+
+[Install]
+WantedBy=multi-user.target
+EOF
 
 # Setup Rest Api
 cd /usr/local/sbin/api
@@ -291,44 +341,11 @@ sudo systemctl daemon-reload
 sudo systemctl restart danted
 sudo systemctl enable danted
 
-# Setup Nginx (+ stream module untuk SNI routing TLS)
+# Setup Nginx
 apt install nginx -y
-apt install libnginx-mod-stream -y
 rm -f /etc/nginx/nginx.conf
 wget -O /etc/nginx/nginx.conf "${hosting}/nginx.conf"
 sed -i "s|server_name fn.com;|server_name $domain;|" /etc/nginx/nginx.conf
-
-# Cari path absolut module stream (Debian/Ubuntu vs others)
-NGX_STREAM_MOD="$(ls /usr/lib/nginx/modules/ngx_stream_module.so /usr/share/nginx/modules/ngx_stream_module.so 2>/dev/null | head -n1)"
-if [ -z "$NGX_STREAM_MOD" ]; then
-    echo "[install] WARNING: ngx_stream_module.so tidak ditemukan. SSH SSL via SNI routing tidak akan jalan."
-    NGX_STREAM_MOD="/usr/lib/nginx/modules/ngx_stream_module.so"
-fi
-
-# Prepend load_module DI ATAS file (sebelum directive apapun) supaya stream
-# directive dikenali. nginx.conf upstream tidak include modules-enabled/.
-sed -i "1i load_module ${NGX_STREAM_MOD};\n" /etc/nginx/nginx.conf
-
-# Append stream block: SNI-based router untuk traffic TLS dari sslh.
-# - SNI = $domain          -> 127.0.0.1:1013 (nginx http TLS-termination utk xray)
-# - SNI lain / kosong      -> 127.0.0.1:1015 (stunnel -> OpenSSH:22)
-cat >> /etc/nginx/nginx.conf <<EOF
-
-# ===== Stream block (SNI router) =====
-stream {
-    map \$ssl_preread_server_name \$rerechan_tls_upstream {
-        ${domain}    127.0.0.1:1013;
-        default     127.0.0.1:1015;
-    }
-
-    server {
-        listen 127.0.0.1:8443;
-        ssl_preread on;
-        proxy_pass \$rerechan_tls_upstream;
-        proxy_connect_timeout 10s;
-    }
-}
-EOF
 
 systemctl stop nginx
 systemctl disable nginx
@@ -461,9 +478,12 @@ echo -e "${domain}" > /usr/local/etc/xray/domain
     /root/.acme.sh/acme.sh --issue -d $domain --standalone -k ec-256
     ~/.acme.sh/acme.sh --installcert -d $domain --fullchainpath /usr/local/etc/xray/xray.crt --keypath /usr/local/etc/xray/xray.key --ecc
 
-# ===== Setup stunnel untuk SSH SSL (TLS termination -> OpenSSH:22) =====
-# Backend internal: 127.0.0.1:1015. Sslh akan rute TLS dengan SNI != ${domain}
-# (mis. SNI live.iflix.com dari HTTP Custom "SSL only") ke port ini.
+# ===== Setup stunnel: TLS termination utk SEMUA traffic TLS =====
+# Stunnel terima TLS di 127.0.0.1:1015 (dari sslh-public), terminasi pakai
+# cert xray, lalu forward bytes plain ke sslh-internal:8444 yang akan
+# deteksi protokol HTTP vs SSH dan rute ke nginx:2080 atau OpenSSH:22.
+# Pendekatan ini bekerja untuk pola "inject bug-host" (SNI = bug, sama
+# untuk xray dan SSH SSL).
 mkdir -p /etc/stunnel /var/run
 cat > /etc/stunnel/ssh-ssl.conf <<'EOF'
 foreground = no
@@ -473,9 +493,9 @@ pid = /var/run/stunnel-ssh.pid
 socket = l:TCP_NODELAY=1
 socket = r:TCP_NODELAY=1
 
-[ssh-ssl]
+[edge-mux]
 accept = 127.0.0.1:1015
-connect = 127.0.0.1:22
+connect = 127.0.0.1:8444
 cert = /usr/local/etc/xray/xray.crt
 key = /usr/local/etc/xray/xray.key
 client = no
@@ -484,9 +504,9 @@ chmod 644 /etc/stunnel/ssh-ssl.conf
 
 cat > /etc/systemd/system/stunnel-ssh.service <<'EOF'
 [Unit]
-Description=Stunnel for SSH-SSL (TLS -> OpenSSH:22)
+Description=Stunnel TLS termination -> sslh-internal (HTTP/SSH dispatch)
 Documentation=https://github.com/sugengagung2020-maker/rere
-After=network-online.target ssh.service sshd.service
+After=network-online.target ssh.service sshd.service sslh-internal.service
 Wants=network-online.target
 
 [Service]
@@ -532,9 +552,11 @@ systemctl disable --now v2ray 2>/dev/null || true
 systemctl enable xray
 systemctl enable nginx
 systemctl enable sslh
+systemctl enable sslh-internal
 systemctl enable stunnel-ssh
 systemctl restart xray
 systemctl restart nginx
+systemctl restart sslh-internal
 systemctl restart sslh
 systemctl restart stunnel-ssh
 systemctl enable proxy
