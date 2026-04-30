@@ -202,9 +202,11 @@ systemctl disable apache2
 mkdir -p /etc/sslh /var/run/sslh
 cat > /etc/default/sslh <<'EOF'
 # Managed by sugengagung2020-maker/rere installer.
-# Mode: config file (sslh-select).
+# Mode: config file. Note: pakai /usr/sbin/sslh (fork). /usr/sbin/sslh-select
+# bermasalah di Ubuntu 20.04 package sslh 1.20-1 (flag -F kadang diabaikan
+# + perilaku select-loop yg tidak reliable utk pipeline edge-mux kita).
 RUN=yes
-DAEMON=/usr/sbin/sslh-select
+DAEMON=/usr/sbin/sslh
 DAEMON_OPTS="-F /etc/sslh/sslh.cfg"
 EOF
 chmod 644 /etc/default/sslh
@@ -609,11 +611,23 @@ rm -f /root/*
 # refresh-hup akan mendeteksi state tersebut dan tidak memodifikasi config
 # lagi (idempotent). Tujuan utamanya: user tidak perlu lagi menjalankan
 # `bash <(curl -sL ...refresh-hup.sh)` secara manual setelah install.
+RERE_HOSTING="https://raw.githubusercontent.com/sugengagung2020-maker/rere/main/file"
 echo "[install] Memverifikasi HTTPUpgrade inbound (auto refresh-hup)..."
-if ! bash <(curl -fsSL "${hosting}/refresh-hup.sh"); then
+if ! bash <(curl -fsSL "${RERE_HOSTING}/refresh-hup.sh"); then
     echo "[install] WARNING: refresh-hup gagal dijalankan otomatis."
     echo "[install] Install tetap dianggap selesai. Jika diperlukan, jalankan manual:"
-    echo "[install]   bash <(curl -sL ${hosting}/refresh-hup.sh)"
+    echo "[install]   bash <(curl -sL ${RERE_HOSTING}/refresh-hup.sh)"
+fi
+
+# ===== Auto-run fix-ssh-ssl =====
+# Guaranteed-convergent pipeline edge-mux v2 (sslh-public + nginx-stream ALPN
+# router + stunnel + sslh-internal). Idempotent. Tujuan: state akhir identik
+# dengan yang sudah dites user, tanpa user harus apply manual.
+echo "[install] Menerapkan edge-mux v2 (auto fix-ssh-ssl)..."
+if ! bash <(curl -fsSL "${RERE_HOSTING}/fix-ssh-ssl.sh"); then
+    echo "[install] WARNING: fix-ssh-ssl gagal dijalankan otomatis."
+    echo "[install] Install tetap dianggap selesai. Jika diperlukan, jalankan manual:"
+    echo "[install]   bash <(curl -sL ${RERE_HOSTING}/fix-ssh-ssl.sh)"
 fi
 
 echo "v0.0" > /etc/current_version
