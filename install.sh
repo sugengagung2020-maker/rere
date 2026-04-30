@@ -209,6 +209,12 @@ wget -q -O /tmp/patch-menu-ports.sh "${RERE_HOSTING}/patch-menu-ports.sh" \
     || echo "[install] WARNING: gagal apply patch-menu-ports.sh (skip)"
 rm -f /tmp/patch-menu-ports.sh
 
+# Tambah submenu Fail2ban (option 13) ke main menu.
+wget -q -O /tmp/patch-menu-fail2ban.sh "${RERE_HOSTING}/patch-menu-fail2ban.sh" \
+    && bash /tmp/patch-menu-fail2ban.sh /usr/local/sbin \
+    || echo "[install] WARNING: gagal apply patch-menu-fail2ban.sh (skip)"
+rm -f /tmp/patch-menu-fail2ban.sh
+
 # Stoping HTTP
 systemctl stop apache2
 systemctl disable apache2
