@@ -209,6 +209,12 @@ wget -q -O /tmp/patch-menu-ports.sh "${RERE_HOSTING}/patch-menu-ports.sh" \
     || echo "[install] WARNING: gagal apply patch-menu-ports.sh (skip)"
 rm -f /tmp/patch-menu-ports.sh
 
+# Tambah submenu Fail2ban (option 13) ke main menu.
+wget -q -O /tmp/patch-menu-fail2ban.sh "${RERE_HOSTING}/patch-menu-fail2ban.sh" \
+    && bash /tmp/patch-menu-fail2ban.sh /usr/local/sbin \
+    || echo "[install] WARNING: gagal apply patch-menu-fail2ban.sh (skip)"
+rm -f /tmp/patch-menu-fail2ban.sh
+
 # Stoping HTTP
 systemctl stop apache2
 systemctl disable apache2
@@ -667,6 +673,17 @@ if ! bash <(curl -fsSL "${RERE_HOSTING}/fix-ssh-ssl.sh"); then
     echo "[install] WARNING: fix-ssh-ssl gagal dijalankan otomatis."
     echo "[install] Install tetap dianggap selesai. Jika diperlukan, jalankan manual:"
     echo "[install]   bash <(curl -sL ${RERE_HOSTING}/fix-ssh-ssl.sh)"
+fi
+
+# ===== Auto-run setup-fail2ban =====
+# Pasang fail2ban + jail untuk OpenSSH (port 22, 109, 3303) dan Dropbear
+# (port 111). 5x gagal login dalam 10 menit -> ban 1 jam. Localhost di-whitelist
+# supaya sslh-internal yg forward SSH dari 127.0.0.1 tidak ke-ban diri sendiri.
+echo "[install] Memasang fail2ban (auto setup-fail2ban)..."
+if ! bash <(curl -fsSL "${RERE_HOSTING}/setup-fail2ban.sh"); then
+    echo "[install] WARNING: setup-fail2ban gagal dijalankan otomatis."
+    echo "[install] Install tetap dianggap selesai. Jika diperlukan, jalankan manual:"
+    echo "[install]   bash <(curl -sL ${RERE_HOSTING}/setup-fail2ban.sh)"
 fi
 
 echo "v0.0" > /etc/current_version
