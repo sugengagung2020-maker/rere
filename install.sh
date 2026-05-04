@@ -540,8 +540,11 @@ WantedBy=multi-user.target
 chmod +x /etc/noobzvpns/*
 cd
 
-# Certificate
-iptables -t nat -D PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 2081 2>/dev/null || true
+# Certificate — hapus SEMUA redirect TCP:80 sebelum issue cert
+while iptables -t nat -D PREROUTING -p tcp -m tcp --dport 80 -j REDIRECT --to-ports 2081 2>/dev/null; do :; done
+while iptables -t nat -D PREROUTING -p tcp -m tcp --dport 80 -j REDIRECT --to-ports 2080 2>/dev/null; do :; done
+while iptables -t nat -D PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 2081 2>/dev/null; do :; done
+while iptables -t nat -D PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 2080 2>/dev/null; do :; done
 echo -e "${domain}" > /usr/local/etc/xray/domain
     rm -rf /root/.acme.sh
     mkdir /root/.acme.sh
