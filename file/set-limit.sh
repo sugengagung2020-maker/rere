@@ -49,7 +49,7 @@ echo -e "━━━━━━━━━━━━━━━━━━━━━━━�
 echo ""
 echo -e " ${BOLD}═══ Akun SSH ═══${NC}"
 echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-ssh_users=$(awk -F: '$7=="/bin/false" {print $1}' /etc/passwd)
+ssh_users=$(awk -F: '$7=="/bin/false" || $7=="/usr/sbin/nologin" || $7=="/sbin/nologin" {print $1}' /etc/passwd)
 if [[ -n "$ssh_users" ]]; then
     for u in $ssh_users; do
         lim=$(get_user_limit "$u")

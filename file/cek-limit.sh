@@ -58,7 +58,7 @@ ssh_total=0
 if [[ -f "$AUTH_LOG" ]]; then
     grep -i "Accepted password for\|Password auth succeeded" "$AUTH_LOG" > /tmp/.cek-limit-auth.tmp 2>/dev/null
 
-    users=$(awk -F: '$7=="/bin/false" {print $1}' /etc/passwd)
+    users=$(awk -F: '$7=="/bin/false" || $7=="/usr/sbin/nologin" || $7=="/sbin/nologin" {print $1}' /etc/passwd)
     ssh_pids=$(ps aux 2>/dev/null | grep "\[priv\]" | grep -v grep | awk '{print $2}')
     db_pids=$(ps aux 2>/dev/null | grep -i "[d]ropbear" | awk '{print $2}')
 

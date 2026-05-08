@@ -52,7 +52,7 @@ limit_ssh() {
     [[ ! -f "$AUTH_LOG" ]] && return
 
     local users
-    users=$(awk -F: '$7=="/bin/false" {print $1}' /etc/passwd)
+    users=$(awk -F: '$7=="/bin/false" || $7=="/usr/sbin/nologin" || $7=="/sbin/nologin" {print $1}' /etc/passwd)
     [[ -z "$users" ]] && return
 
     # Cache auth.log entries for speed
